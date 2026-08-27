@@ -6,6 +6,7 @@ import random
 from pathlib import Path
 
 from reliability_lab.chaos import (
+    collect_redis_evidence,
     load_queries,
     run_scenario,
     run_scenario_concurrent,
@@ -56,10 +57,19 @@ def main() -> None:
     concurrent_path = output.with_name("concurrent_metrics.json")
     concurrent.write_json(concurrent_path)
 
+    redis_evidence = collect_redis_evidence(
+        config.cache.redis_url,
+        config.cache.ttl_seconds,
+        config.cache.similarity_threshold,
+    )
+    redis_evidence_path = output.with_name("redis_evidence.json")
+    redis_evidence_path.write_text(json.dumps(redis_evidence, indent=2, ensure_ascii=False))
+
     print(f"wrote {output}")
     print(f"wrote {output.with_suffix('.csv')}")
     print(f"wrote {comparison_path}")
     print(f"wrote {concurrent_path}")
+    print(f"wrote {redis_evidence_path}")
 
 
 if __name__ == "__main__":
