@@ -1,0 +1,11 @@
+{
+  "available": true,
+  "shared_response": "shared cache evidence response",
+  "score": 1.0,
+  "keys": [
+    "rl:cache:evidence:6ddec03bbc60"
+  ],
+  "ttls_seconds": {
+    "rl:cache:evidence:6ddec03bbc60": 300
+  }
+}
