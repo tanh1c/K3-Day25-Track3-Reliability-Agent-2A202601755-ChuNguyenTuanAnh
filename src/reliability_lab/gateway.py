@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+from reliability_lab.budget import CostBudget
 from reliability_lab.cache import ResponseCache, SharedRedisCache
 from reliability_lab.circuit_breaker import CircuitBreaker, CircuitOpenError
 from reliability_lab.providers import FakeLLMProvider, ProviderError
@@ -26,10 +27,12 @@ class ReliabilityGateway:
         providers: list[FakeLLMProvider],
         breakers: dict[str, CircuitBreaker],
         cache: ResponseCache | SharedRedisCache | None = None,
+        budget: CostBudget | None = None,
     ):
         self.providers = providers
         self.breakers = breakers
         self.cache = cache
+        self.budget = budget
 
     def complete(self, prompt: str) -> GatewayResponse:
         if self.cache is not None:
@@ -44,8 +47,23 @@ class ReliabilityGateway:
                     estimated_cost=0.0,
                 )
 
+        if self.budget is not None and self.budget.is_exhausted():
+            return GatewayResponse(
+                text="The service is temporarily degraded. Please try again soon.",
+                route="static_fallback",
+                provider=None,
+                cache_hit=False,
+                latency_ms=0.0,
+                estimated_cost=0.0,
+                error="budget_exhausted",
+            )
+
+        provider_order = (
+            self.budget.ordered(self.providers) if self.budget is not None else list(self.providers)
+        )
+        primary_name = self.providers[0].name if self.providers else None
         last_error: str | None = None
-        for index, provider in enumerate(self.providers):
+        for provider in provider_order:
             breaker = self.breakers[provider.name]
             try:
                 response = breaker.call(provider.complete, prompt)
@@ -55,10 +73,12 @@ class ReliabilityGateway:
 
             if self.cache is not None:
                 self.cache.set(prompt, response.text, {"provider": provider.name})
+            if self.budget is not None:
+                self.budget.record(response.estimated_cost)
 
             return GatewayResponse(
                 text=response.text,
-                route="primary" if index == 0 else "fallback",
+                route="primary" if provider.name == primary_name else "fallback",
                 provider=response.provider,
                 cache_hit=False,
                 latency_ms=response.latency_ms,
