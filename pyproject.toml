@@ -29,6 +29,11 @@ markers = ["todo: tests that should pass after students implement TODOs"]
 line-length = 100
 src = ["src", "tests", "scripts"]
 
+[tool.ruff.lint.per-file-ignores]
+"tests/test_cache.py" = ["RUF059"]
+"tests/test_redis_cache.py" = ["BLE001"]
+"tests/test_todo_requirements.py" = ["F401", "I001", "SIM115"]
+
 [tool.mypy]
 python_version = "3.10"
 strict = true
