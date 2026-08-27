@@ -4,7 +4,7 @@ import time
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import TypeVar
+from typing import Protocol, TypeVar
 
 T = TypeVar("T")
 
@@ -17,6 +17,23 @@ class CircuitState(str, Enum):
 
 class CircuitOpenError(RuntimeError):
     """Raised when a circuit is open and calls should fail fast."""
+
+
+class CircuitBreakerLike(Protocol):
+    """Structural contract shared by local and Redis circuit breakers."""
+
+    @property
+    def name(self) -> str: ...
+
+    @property
+    def state(self) -> CircuitState: ...
+
+    @property
+    def transition_log(self) -> list[dict[str, str | float]]: ...
+
+    def allow_request(self) -> bool: ...
+
+    def call(self, fn: Callable[..., T], *args: object, **kwargs: object) -> T: ...
 
 
 @dataclass(slots=True)
