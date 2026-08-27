@@ -1,8 +1,8 @@
 """Configuration tests for opt-in distributed breaker and cost budget."""
 from __future__ import annotations
 
-import redis as redis_lib
 import pytest
+import redis as redis_lib
 from redis.exceptions import RedisError
 
 from reliability_lab.budget import CostBudget
