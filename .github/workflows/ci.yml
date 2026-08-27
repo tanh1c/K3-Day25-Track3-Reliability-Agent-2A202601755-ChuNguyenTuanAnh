@@ -66,12 +66,25 @@ jobs:
           grep -q "6 passed" reports/rubric-test-output.txt
           grep -q "7 xpassed" reports/rubric-test-output.txt
 
+      - name: Full bonus tests with Redis enabled
+        run: |
+          mkdir -p reports
+          set -o pipefail
+          pytest -q tests/test_redis_circuit_breaker.py | tee reports/redis-circuit-test-output.txt
+          grep -q "3 passed" reports/redis-circuit-test-output.txt
+          ! grep -qi "skipped" reports/redis-circuit-test-output.txt
+          pytest -q tests/test_budget_routing.py tests/test_bonus_config.py tests/test_bonus_evidence.py | tee reports/bonus-test-output.txt
+          grep -q "9 passed" reports/bonus-test-output.txt
+          ! grep -qi "skipped" reports/bonus-test-output.txt
+
       - name: Full make test with Redis enabled
         run: |
           mkdir -p reports
           set -o pipefail
           make test | tee reports/test-output.txt
-          grep -q "39 passed, 7 xpassed" reports/test-output.txt
+          grep -Eq "[0-9]+ passed, 7 xpassed" reports/test-output.txt
+          ! grep -qi "failed" reports/test-output.txt
+          ! grep -qi "skipped" reports/test-output.txt
 
       - name: Generate chaos evidence exactly like grader
         run: make run-chaos
@@ -79,7 +92,7 @@ jobs:
       - name: Generate final report exactly like grader
         run: make report
 
-      - name: Validate grader artifacts and checklist
+      - name: Validate grader artifacts and full bonus checklist
         run: |
           test -s docker-compose.yml
           test -s reports/metrics.json
@@ -87,10 +100,13 @@ jobs:
           test -s reports/cache_comparison.json
           test -s reports/concurrent_metrics.json
           test -s reports/redis_evidence.json
+          test -s reports/bonus_evidence.json
           test -s reports/final_report.md
           python - <<'PY'
           import json
           from pathlib import Path
+
+          import yaml
 
           metrics = json.loads(Path("reports/metrics.json").read_text())
           required = {
@@ -119,6 +135,42 @@ jobs:
           assert redis_evidence["score"] == 1.0
           assert redis_evidence["keys"], "Redis key evidence is empty"
 
+          bonus = json.loads(Path("reports/bonus_evidence.json").read_text())
+          distributed = bonus["distributed_circuit_breaker"]
+          for key in [
+              "available",
+              "opened_by_instance_a",
+              "observed_open_by_instance_b",
+              "first_probe_acquired",
+              "second_probe_blocked",
+              "observed_closed_by_instance_b",
+          ]:
+              assert distributed[key] is True, key
+          assert distributed["instance_a_final_state"] == "closed"
+          assert distributed["instance_b_final_state"] == "closed"
+          for reason in [
+              "failure_threshold_reached",
+              "reset_timeout_elapsed",
+              "probe_success",
+          ]:
+              assert reason in distributed["transition_reasons"], reason
+
+          cost = bonus["cost_aware_routing"]
+          assert cost["switch_ratio"] == 0.8
+          assert cost["below_80_percent"]["provider"] == "primary"
+          assert cost["below_80_percent"]["route"] == "primary"
+          assert cost["at_80_percent"]["provider"] == "backup"
+          assert cost["at_80_percent"]["route"] == "fallback"
+          assert cost["at_100_percent"]["provider"] is None
+          assert cost["at_100_percent"]["route"] == "static_fallback"
+          assert cost["at_100_percent"]["error"] == "budget_exhausted"
+          assert cost["at_100_percent"]["estimated_cost"] == 0.0
+
+          config = yaml.safe_load(Path("configs/default.yaml").read_text())
+          assert config["circuit_breaker"]["backend"] == "memory"
+          assert config["budget"]["enabled"] is False
+          assert config["budget"]["switch_ratio"] == 0.8
+
           report = Path("reports/final_report.md").read_text()
           assert "TODO" not in report
           assert "Chu Nguyễn Tuấn Anh" in report
@@ -132,11 +184,27 @@ jobs:
               "Redis shared cache",
               "Redis CLI output",
               "Chaos scenarios",
+              "Stretch goals — complete bonus evidence",
               "Failure analysis",
           ]:
               assert heading in report, heading
           assert 'redis-cli KEYS "rl:cache:*"' in report
-          print("grader checklist validated")
+
+          stretch_labels = [
+              "ThreadPoolExecutor concurrent load",
+              "Redis shared circuit-breaker state",
+              "Redis cache graceful degradation",
+              "Cost-aware routing at 80%/100%",
+              "Hypothesis circuit-breaker fuzzing",
+              "SLO table and validation",
+          ]
+          report_lines = report.splitlines()
+          for label in stretch_labels:
+              rows = [line for line in report_lines if line.startswith(f"| {label} |")]
+              assert len(rows) == 1, f"missing/duplicate stretch row: {label}"
+              assert "| PASS |" in rows[0], rows[0]
+
+          print("core grader checklist + all six stretch goals validated")
           PY
 
       - name: Upload grading evidence
@@ -147,11 +215,14 @@ jobs:
           path: |
             reports/test-output.txt
             reports/rubric-test-output.txt
+            reports/redis-circuit-test-output.txt
+            reports/bonus-test-output.txt
             reports/metrics.json
             reports/metrics.csv
             reports/cache_comparison.json
             reports/concurrent_metrics.json
             reports/redis_evidence.json
+            reports/bonus_evidence.json
             reports/final_report.md
           if-no-files-found: warn
 

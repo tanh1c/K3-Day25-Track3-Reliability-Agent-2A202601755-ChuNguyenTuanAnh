@@ -1,0 +1,38 @@
+{
+  "distributed_circuit_breaker": {
+    "available": true,
+    "opened_by_instance_a": true,
+    "observed_open_by_instance_b": true,
+    "first_probe_acquired": true,
+    "second_probe_blocked": true,
+    "observed_closed_by_instance_b": true,
+    "instance_a_final_state": "closed",
+    "instance_b_final_state": "closed",
+    "transition_reasons": [
+      "failure_threshold_reached",
+      "reset_timeout_elapsed",
+      "probe_success"
+    ]
+  },
+  "cost_aware_routing": {
+    "switch_ratio": 0.8,
+    "below_80_percent": {
+      "provider": "primary",
+      "route": "primary",
+      "error": null,
+      "estimated_cost": 0.00046
+    },
+    "at_80_percent": {
+      "provider": "backup",
+      "route": "fallback",
+      "error": null,
+      "estimated_cost": 0.00048
+    },
+    "at_100_percent": {
+      "provider": null,
+      "route": "static_fallback",
+      "error": "budget_exhausted",
+      "estimated_cost": 0.0
+    }
+  }
+}

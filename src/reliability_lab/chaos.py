@@ -2,18 +2,22 @@ from __future__ import annotations
 
 import json
 import random
+import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any
 
 import redis as redis_lib
+from redis.exceptions import RedisError
 
+from reliability_lab.budget import CostBudget
 from reliability_lab.cache import ResponseCache, SharedRedisCache
-from reliability_lab.circuit_breaker import CircuitBreaker
+from reliability_lab.circuit_breaker import CircuitBreaker, CircuitBreakerLike, CircuitState
 from reliability_lab.config import LabConfig, ScenarioConfig
 from reliability_lab.gateway import ReliabilityGateway
 from reliability_lab.metrics import RunMetrics
 from reliability_lab.providers import FakeLLMProvider
+from reliability_lab.redis_circuit_breaker import SharedRedisCircuitBreaker
 
 
 def load_queries(path: str | Path = "data/sample_queries.jsonl") -> list[str]:
@@ -23,6 +27,45 @@ def load_queries(path: str | Path = "data/sample_queries.jsonl") -> list[str]:
             continue
         queries.append(json.loads(line)["query"])
     return queries
+
+
+def _local_breakers(config: LabConfig) -> dict[str, CircuitBreakerLike]:
+    return {
+        provider_config.name: CircuitBreaker(
+            name=provider_config.name,
+            failure_threshold=config.circuit_breaker.failure_threshold,
+            reset_timeout_seconds=config.circuit_breaker.reset_timeout_seconds,
+            success_threshold=config.circuit_breaker.success_threshold,
+        )
+        for provider_config in config.providers
+    }
+
+
+def _build_breakers(config: LabConfig) -> dict[str, CircuitBreakerLike]:
+    if config.circuit_breaker.backend != "redis":
+        return _local_breakers(config)
+
+    distributed: dict[str, CircuitBreakerLike] = {}
+    opened_clients: list[SharedRedisCircuitBreaker] = []
+    try:
+        for provider_config in config.providers:
+            breaker = SharedRedisCircuitBreaker(
+                name=provider_config.name,
+                failure_threshold=config.circuit_breaker.failure_threshold,
+                reset_timeout_seconds=config.circuit_breaker.reset_timeout_seconds,
+                success_threshold=config.circuit_breaker.success_threshold,
+                redis_url=config.circuit_breaker.redis_url,
+            )
+            if not breaker.ping():
+                breaker.close()
+                raise RedisError("Redis circuit-breaker backend is unavailable")
+            distributed[provider_config.name] = breaker
+            opened_clients.append(breaker)
+    except RedisError:
+        for breaker in opened_clients:
+            breaker.close()
+        return _local_breakers(config)
+    return distributed
 
 
 def build_gateway(
@@ -44,15 +87,7 @@ def build_gateway(
             )
         )
 
-    breakers = {
-        provider_config.name: CircuitBreaker(
-            name=provider_config.name,
-            failure_threshold=config.circuit_breaker.failure_threshold,
-            reset_timeout_seconds=config.circuit_breaker.reset_timeout_seconds,
-            success_threshold=config.circuit_breaker.success_threshold,
-        )
-        for provider_config in config.providers
-    }
+    breakers = _build_breakers(config)
 
     cache: ResponseCache | SharedRedisCache | None = None
     if config.cache.enabled:
@@ -73,7 +108,12 @@ def build_gateway(
         else:
             cache = ResponseCache(config.cache.ttl_seconds, config.cache.similarity_threshold)
 
-    return ReliabilityGateway(providers, breakers, cache)
+    budget = (
+        CostBudget(config.budget.limit, config.budget.switch_ratio)
+        if config.budget.enabled
+        else None
+    )
+    return ReliabilityGateway(providers, breakers, cache=cache, budget=budget)
 
 
 def collect_redis_evidence(
@@ -118,6 +158,118 @@ def collect_redis_evidence(
     finally:
         reader.close()
         writer.close()
+
+
+def collect_distributed_breaker_evidence(redis_url: str) -> dict[str, object]:
+    """Prove OPEN/HALF_OPEN/CLOSED state is shared by two Redis breaker instances."""
+    prefix = "rl:circuit:evidence:"
+    first: SharedRedisCircuitBreaker | None = None
+    second: SharedRedisCircuitBreaker | None = None
+    try:
+        first = SharedRedisCircuitBreaker(
+            "primary",
+            failure_threshold=2,
+            reset_timeout_seconds=0.05,
+            success_threshold=1,
+            redis_url=redis_url,
+            prefix=prefix,
+        )
+        second = SharedRedisCircuitBreaker(
+            "primary",
+            failure_threshold=2,
+            reset_timeout_seconds=0.05,
+            success_threshold=1,
+            redis_url=redis_url,
+            prefix=prefix,
+        )
+        if not first.ping() or not second.ping():
+            return {"available": False}
+
+        first.flush()
+        first.record_failure()
+        first.record_failure()
+        opened_by_a = first.state == CircuitState.OPEN
+        observed_open_by_b = second.state == CircuitState.OPEN
+
+        time.sleep(0.06)
+        first_probe_acquired = first.allow_request()
+        second_probe_blocked = not second.allow_request()
+        first.record_success()
+
+        final_a = first.state
+        final_b = second.state
+        reasons = [str(entry["reason"]) for entry in first.transition_log]
+        return {
+            "available": True,
+            "opened_by_instance_a": opened_by_a,
+            "observed_open_by_instance_b": observed_open_by_b,
+            "first_probe_acquired": first_probe_acquired,
+            "second_probe_blocked": second_probe_blocked,
+            "observed_closed_by_instance_b": final_b == CircuitState.CLOSED,
+            "instance_a_final_state": final_a.value,
+            "instance_b_final_state": final_b.value,
+            "transition_reasons": reasons,
+        }
+    except RedisError:
+        return {"available": False}
+    finally:
+        if first is not None:
+            try:
+                first.flush()
+            except RedisError:
+                pass
+            first.close()
+        if second is not None:
+            second.close()
+
+
+def _budget_evidence_gateway(spent: float) -> ReliabilityGateway:
+    providers = [
+        FakeLLMProvider("primary", 0.0, 1, 0.01),
+        FakeLLMProvider("backup", 0.0, 1, 0.006),
+    ]
+    breakers: dict[str, CircuitBreakerLike] = {
+        provider.name: CircuitBreaker(
+            name=provider.name,
+            failure_threshold=3,
+            reset_timeout_seconds=1.0,
+            success_threshold=1,
+        )
+        for provider in providers
+    }
+    return ReliabilityGateway(
+        providers,
+        breakers,
+        budget=CostBudget(limit=1.0, switch_ratio=0.8, spent=spent),
+    )
+
+
+def collect_cost_routing_evidence() -> dict[str, object]:
+    """Prove primary, cheaper-provider, and exhausted-budget routing thresholds."""
+    below = _budget_evidence_gateway(0.79).complete("budget evidence below eighty")
+    at_switch = _budget_evidence_gateway(0.80).complete("budget evidence at eighty")
+    exhausted = _budget_evidence_gateway(1.0).complete("budget evidence exhausted")
+    return {
+        "switch_ratio": 0.8,
+        "below_80_percent": {
+            "provider": below.provider,
+            "route": below.route,
+            "error": below.error,
+            "estimated_cost": below.estimated_cost,
+        },
+        "at_80_percent": {
+            "provider": at_switch.provider,
+            "route": at_switch.route,
+            "error": at_switch.error,
+            "estimated_cost": at_switch.estimated_cost,
+        },
+        "at_100_percent": {
+            "provider": exhausted.provider,
+            "route": exhausted.route,
+            "error": exhausted.error,
+            "estimated_cost": exhausted.estimated_cost,
+        },
+    }
 
 
 def calculate_recovery_time_ms(gateway: ReliabilityGateway) -> float | None:

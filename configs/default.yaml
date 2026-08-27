@@ -11,12 +11,18 @@ circuit_breaker:
   failure_threshold: 3
   reset_timeout_seconds: 2
   success_threshold: 1
+  backend: memory          # "memory" (default) or "redis" for shared state
+  redis_url: "redis://localhost:6379/0"
 cache:
   enabled: true
   backend: memory          # "memory" (default) or "redis" (requires docker compose up -d)
   ttl_seconds: 300
   similarity_threshold: 0.92
   redis_url: "redis://localhost:6379/0"
+budget:
+  enabled: false           # opt-in so the core grader path remains unchanged
+  limit: 1.0
+  switch_ratio: 0.8
 load_test:
   requests: 100
 

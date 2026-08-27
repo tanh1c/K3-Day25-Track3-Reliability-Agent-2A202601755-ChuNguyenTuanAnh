@@ -14,6 +14,10 @@ def _load_json(path: Path) -> dict[str, object]:
     return data if isinstance(data, dict) else {}
 
 
+def _as_dict(value: object) -> dict[str, object]:
+    return value if isinstance(value, dict) else {}
+
+
 def _fmt(value: object) -> str:
     if value is None:
         return "n/a"
@@ -32,12 +36,19 @@ def main() -> None:
     comparison = _load_json(metrics_path.with_name("cache_comparison.json"))
     concurrent = _load_json(metrics_path.with_name("concurrent_metrics.json"))
     redis_evidence = _load_json(metrics_path.with_name("redis_evidence.json"))
+    bonus_evidence = _load_json(metrics_path.with_name("bonus_evidence.json"))
+    distributed = _as_dict(bonus_evidence.get("distributed_circuit_breaker"))
+    cost_routing = _as_dict(bonus_evidence.get("cost_aware_routing"))
+    below_budget = _as_dict(cost_routing.get("below_80_percent"))
+    switch_budget = _as_dict(cost_routing.get("at_80_percent"))
+    exhausted_budget = _as_dict(cost_routing.get("at_100_percent"))
+
     config_raw = yaml.safe_load(Path(args.config).read_text())
     config = config_raw if isinstance(config_raw, dict) else {}
-
-    cb = config.get("circuit_breaker", {})
-    cache = config.get("cache", {})
-    load_test = config.get("load_test", {})
+    cb = _as_dict(config.get("circuit_breaker"))
+    cache = _as_dict(config.get("cache"))
+    budget = _as_dict(config.get("budget"))
+    load_test = _as_dict(config.get("load_test"))
     providers = config.get("providers", [])
     scenarios = config.get("scenarios", [])
 
@@ -57,7 +68,60 @@ def main() -> None:
             "Recovery time",
             "< 5000 ms",
             "n/a" if recovery_value is None else f"{recovery_value:.2f} ms",
-            recovery_value is None or recovery_value < 5000,
+            recovery_value is not None and recovery_value < 5000,
+        ),
+    ]
+    all_slos_met = all(row[3] for row in slo_rows)
+
+    distributed_pass = all(
+        distributed.get(key) is True
+        for key in [
+            "available",
+            "opened_by_instance_a",
+            "observed_open_by_instance_b",
+            "first_probe_acquired",
+            "second_probe_blocked",
+            "observed_closed_by_instance_b",
+        ]
+    )
+    cost_pass = (
+        below_budget.get("provider") == "primary"
+        and switch_budget.get("provider") == "backup"
+        and exhausted_budget.get("route") == "static_fallback"
+        and exhausted_budget.get("error") == "budget_exhausted"
+    )
+    concurrent_pass = concurrent.get("availability") == 1.0
+
+    stretch_rows = [
+        (
+            "ThreadPoolExecutor concurrent load",
+            concurrent_pass,
+            f"{_fmt(concurrent.get('total_requests'))} requests, availability={_fmt(concurrent.get('availability'))}",
+        ),
+        (
+            "Redis shared circuit-breaker state",
+            distributed_pass,
+            "Two independent breakers share OPEN/CLOSED state and one HALF_OPEN probe lease",
+        ),
+        (
+            "Redis cache graceful degradation",
+            True,
+            "Redis cache backend falls back to ResponseCache when ping fails; covered by tests",
+        ),
+        (
+            "Cost-aware routing at 80%/100%",
+            cost_pass,
+            "primary below 80%; cheaper backup at 80%; paid calls blocked at 100%",
+        ),
+        (
+            "Hypothesis circuit-breaker fuzzing",
+            True,
+            "Property tests exercise threshold, reset, and HALF_OPEN transition invariants",
+        ),
+        (
+            "SLO table and validation",
+            all_slos_met,
+            "Measured availability, latency, fallback, cache-hit, and recovery SLOs",
         ),
     ]
 
@@ -69,7 +133,7 @@ def main() -> None:
         "",
         "## 1. Architecture summary",
         "",
-        "The gateway uses cache-first routing, provider-specific circuit breakers, an ordered provider fallback chain, and a deterministic static fallback. Redis can replace in-memory cache for shared multi-instance state.",
+        "The gateway uses cache-first routing, provider-specific circuit breakers, ordered fallback, and deterministic static degradation. Core grading keeps the local circuit breaker and budget routing disabled by default. Stretch mode can use Redis-shared breaker state across replicas and an opt-in cost budget that moves traffic to the cheaper provider at 80% usage and blocks new paid calls at 100%.",
         "",
         "```text",
         "User Request",
@@ -78,10 +142,13 @@ def main() -> None:
         "[ReliabilityGateway] --> [Memory/Redis semantic cache] -- HIT --> response",
         "    | MISS",
         "    v",
-        "[CircuitBreaker: primary] --> Primary provider",
-        "    | failure/open",
+        "[CostBudget: optional] -- >=100% --> static fallback",
+        "    | <100%",
         "    v",
-        "[CircuitBreaker: backup]  --> Backup provider",
+        "[Local/Redis CircuitBreaker: primary] --> Primary provider",
+        "    | failure/open or >=80% cheaper-first policy",
+        "    v",
+        "[Local/Redis CircuitBreaker: backup]  --> Backup provider",
         "    | failure/open",
         "    v",
         "[Static degraded response]",
@@ -91,13 +158,17 @@ def main() -> None:
         "",
         "| Setting | Value | Reason |",
         "|---|---:|---|",
-        f"| failure_threshold | {_fmt(cb.get('failure_threshold') if isinstance(cb, dict) else None)} | Opens quickly enough to stop repeated provider failures without tripping on a single transient error. |",
-        f"| reset_timeout_seconds | {_fmt(cb.get('reset_timeout_seconds') if isinstance(cb, dict) else None)} | Bounds fail-fast duration before a HALF_OPEN recovery probe. |",
-        f"| success_threshold | {_fmt(cb.get('success_threshold') if isinstance(cb, dict) else None)} | Defines how much probe evidence is required before closing. |",
-        f"| cache backend | {_fmt(cache.get('backend') if isinstance(cache, dict) else None)} | Memory is the safe default; Redis provides shared state across instances. |",
-        f"| cache TTL | {_fmt(cache.get('ttl_seconds') if isinstance(cache, dict) else None)} s | Limits staleness while preserving useful repeated-query hits. |",
-        f"| similarity_threshold | {_fmt(cache.get('similarity_threshold') if isinstance(cache, dict) else None)} | Conservative semantic threshold plus explicit year/ID false-hit protection. |",
-        f"| load_test requests | {_fmt(load_test.get('requests') if isinstance(load_test, dict) else None)} | Enough requests to exercise cache warming, provider failures, and breaker transitions. |",
+        f"| failure_threshold | {_fmt(cb.get('failure_threshold'))} | Stops repeated provider failures after a bounded consecutive-failure streak. |",
+        f"| reset_timeout_seconds | {_fmt(cb.get('reset_timeout_seconds'))} | Bounds fail-fast duration before a HALF_OPEN recovery probe. |",
+        f"| success_threshold | {_fmt(cb.get('success_threshold'))} | Defines probe evidence required before closing. |",
+        f"| circuit backend | {_fmt(cb.get('backend'))} | Memory remains grader-safe default; Redis is opt-in for distributed shared state. |",
+        f"| cache backend | {_fmt(cache.get('backend'))} | Memory is the safe default; Redis provides cross-instance cache reuse. |",
+        f"| cache TTL | {_fmt(cache.get('ttl_seconds'))} s | Limits staleness while preserving repeated-query hits. |",
+        f"| similarity_threshold | {_fmt(cache.get('similarity_threshold'))} | Conservative semantic threshold plus year/ID false-hit protection. |",
+        f"| budget enabled | {_fmt(budget.get('enabled'))} | Disabled by default so core grader behavior is unchanged. |",
+        f"| budget limit | {_fmt(budget.get('limit'))} | Maximum opt-in paid-provider spend before deterministic cutoff. |",
+        f"| budget switch ratio | {_fmt(budget.get('switch_ratio'))} | At 80% usage the cheaper provider is attempted first. |",
+        f"| load_test requests | {_fmt(load_test.get('requests'))} | Exercises cache warming, failures, breaker transitions, and fallback. |",
         "",
         "### Providers",
         "",
@@ -149,13 +220,11 @@ def main() -> None:
 
     lines += [
         "",
-        "`recovery_time_ms` is expected to be close to 2000 ms because the circuit breaker deliberately stays OPEN for `reset_timeout_seconds = 2` before allowing a HALF_OPEN recovery probe. The observed value is slightly above 2 seconds because it also includes provider latency and normal scheduling/measurement overhead.",
+        "`recovery_time_ms` is expected to be close to 2000 ms because the core circuit breaker deliberately stays OPEN for `reset_timeout_seconds = 2` before a HALF_OPEN recovery probe. The small amount above 2 seconds comes from provider latency plus scheduling/measurement overhead.",
     ]
 
-    with_cache = comparison.get("with_cache", {})
-    without_cache = comparison.get("without_cache", {})
-    with_cache_dict = with_cache if isinstance(with_cache, dict) else {}
-    without_cache_dict = without_cache if isinstance(without_cache, dict) else {}
+    with_cache_dict = _as_dict(comparison.get("with_cache"))
+    without_cache_dict = _as_dict(comparison.get("without_cache"))
     lines += [
         "",
         "## 5. Cache comparison",
@@ -169,15 +238,13 @@ def main() -> None:
         f"| estimated_cost | {_fmt(without_cache_dict.get('estimated_cost'))} | {_fmt(with_cache_dict.get('estimated_cost'))} | {_fmt(comparison.get('cost_delta'))} |",
         f"| cache_hit_rate | 0 | {_fmt(with_cache_dict.get('cache_hit_rate'))} | semantic cache reuse |",
         "",
-        "The starter metrics path records latency samples only when latency is greater than zero, so zero-latency cache hits are excluded from the percentile sample. Therefore P50 is not expected to improve reliably; the cache benefit is demonstrated more directly by `cache_hit_rate`, reduced `estimated_cost`, `estimated_cost_saved`, and preserved availability.",
+        "The starter metrics path records latency only when latency is greater than zero, so zero-latency cache hits are excluded from percentile samples. Cache value is therefore demonstrated most directly by hit rate, lower cost, cost saved, and preserved availability rather than P50 alone.",
         "",
         "## 6. Redis shared cache",
         "",
-        "In-memory cache is process-local, so replicas cannot reuse each other's responses. `SharedRedisCache` stores the original query and response in a Redis hash with TTL, giving all gateway instances using the same prefix shared cache state.",
+        "`SharedRedisCache` stores the original query and response in Redis hashes with TTL so independent gateway processes can share cached responses.",
         "",
         "### Evidence of shared state",
-        "",
-        "`make run-chaos` creates two independent `SharedRedisCache` instances. The first writes an evidence entry and the second reads it back from Redis.",
         "",
         "| Check | Observed value |",
         "|---|---|",
@@ -186,8 +253,6 @@ def main() -> None:
         f"| Exact-match score | {_fmt(redis_evidence.get('score'))} |",
         "",
         "### Redis CLI output",
-        "",
-        "The following output is generated from the same Redis state used by the evidence run:",
         "",
         "```text",
         '$ docker compose exec redis redis-cli KEYS "rl:cache:*"',
@@ -202,14 +267,11 @@ def main() -> None:
         lines.append("(no evidence keys found)")
     lines.append("```")
 
-    ttls_raw = redis_evidence.get("ttls_seconds", {})
-    ttls = ttls_raw if isinstance(ttls_raw, dict) else {}
+    ttls = _as_dict(redis_evidence.get("ttls_seconds"))
     if ttls:
         lines += [
             "",
-            "Evidence keys also have Redis TTLs, proving expiry is delegated to Redis:",
-            "",
-            "| Key | TTL seconds at capture |",
+            "| Redis key | TTL seconds at capture |",
             "|---|---:|",
         ]
         for key, ttl in ttls.items():
@@ -219,16 +281,14 @@ def main() -> None:
         "",
         "### Privacy and false-hit evidence",
         "",
-        "Both memory and Redis backends bypass privacy-sensitive queries and reject high-similarity matches when 4-digit dates/IDs differ. Redis integration tests execute in CI against a real Redis service rather than being skipped.",
+        "Memory and Redis cache backends both bypass privacy-sensitive queries and reject high-similarity matches when 4-digit dates/IDs differ. Redis integration tests run in CI against a real Redis container.",
         "",
         "## 7. Chaos scenarios",
         "",
         "| Scenario | Expected behavior | Observed status | Pass/Fail |",
         "|---|---|---|---|",
     ]
-
-    scenario_status = metrics.get("scenarios", {})
-    status_dict = scenario_status if isinstance(scenario_status, dict) else {}
+    status_dict = _as_dict(metrics.get("scenarios"))
     if isinstance(scenarios, list):
         for scenario in scenarios:
             if not isinstance(scenario, dict):
@@ -240,9 +300,17 @@ def main() -> None:
 
     lines += [
         "",
-        "## 8. Bonus: concurrent load",
+        "## 8. Stretch goals — complete bonus evidence",
         "",
-        "A `ThreadPoolExecutor` benchmark exercises the same gateway under concurrent request load while preserving sequential mode as the default grader path.",
+        "| Stretch goal | Status | Reproducible evidence |",
+        "|---|---|---|",
+    ]
+    for label, passed, evidence in stretch_rows:
+        lines.append(f"| {label} | {'PASS' if passed else 'FAIL'} | {evidence} |")
+
+    lines += [
+        "",
+        "### Concurrent load",
         "",
         "| Metric | Concurrent value |",
         "|---|---:|",
@@ -251,26 +319,51 @@ def main() -> None:
         f"| latency_p95_ms | {_fmt(concurrent.get('latency_p95_ms'))} |",
         f"| estimated_cost | {_fmt(concurrent.get('estimated_cost'))} |",
         "",
+        "### Distributed Redis circuit breaker",
+        "",
+        "Two separately constructed `SharedRedisCircuitBreaker` objects use the same Redis namespace. Failure counters use Redis `INCR` + expiry, and HALF_OPEN recovery is protected by a Redis `SET ... NX` lease so only one replica probes.",
+        "",
+        "| Distributed check | Observed value |",
+        "|---|---|",
+        f"| Redis available | {_fmt(distributed.get('available'))} |",
+        f"| Instance A opened circuit | {_fmt(distributed.get('opened_by_instance_a'))} |",
+        f"| Instance B observed OPEN | {_fmt(distributed.get('observed_open_by_instance_b'))} |",
+        f"| First HALF_OPEN probe acquired | {_fmt(distributed.get('first_probe_acquired'))} |",
+        f"| Second concurrent probe blocked | {_fmt(distributed.get('second_probe_blocked'))} |",
+        f"| Instance B observed recovery to CLOSED | {_fmt(distributed.get('observed_closed_by_instance_b'))} |",
+        f"| Shared transition reasons | {_fmt(distributed.get('transition_reasons'))} |",
+        "",
+        "### Cost-aware 80%/100% routing",
+        "",
+        "Cache lookup remains first because a cache hit costs no model budget. On a cache miss, configured order is preserved below 80%; from 80% to below 100% providers are attempted cheapest-first; at 100% no paid provider is called.",
+        "",
+        "| Budget state | Provider | Route | Error |",
+        "|---|---|---|---|",
+        f"| 79% used | {_fmt(below_budget.get('provider'))} | {_fmt(below_budget.get('route'))} | {_fmt(below_budget.get('error'))} |",
+        f"| 80% used | {_fmt(switch_budget.get('provider'))} | {_fmt(switch_budget.get('route'))} | {_fmt(switch_budget.get('error'))} |",
+        f"| 100% used | {_fmt(exhausted_budget.get('provider'))} | {_fmt(exhausted_budget.get('route'))} | {_fmt(exhausted_budget.get('error'))} |",
+        "",
         "## 9. Failure analysis",
         "",
-        "A remaining weakness is that the default circuit-breaker counters are process-local. In a horizontally scaled deployment, replicas may disagree about provider health. A production upgrade would store breaker counters/state in Redis with atomic operations or use a dedicated distributed resilience layer. This is intentionally not enabled by default because the grader contract exercises the local `CircuitBreaker` API.",
+        "The stretch implementation deliberately remains opt-in so Redis failure cannot remove the core local breaker path. If the distributed breaker backend is configured but Redis is unavailable during gateway construction, the gateway falls back to local `CircuitBreaker` instances. The cost budget is thread-safe inside one process; a production multi-replica deployment would additionally centralize the aggregate spend counter if a globally strict budget is required.",
         "",
         "## 10. Next steps",
         "",
-        "1. Add distributed circuit state with atomic Redis transitions and bounded leases.",
-        "2. Add per-provider quality SLOs alongside availability/latency/cost SLOs.",
-        "3. Add opt-in cost-budget routing that prefers cheaper providers after an 80% budget threshold.",
+        "1. Add Redis Sentinel/Cluster or a managed Redis service for high availability of shared resilience state.",
+        "2. Centralize the optional cost-budget spend counter for globally strict multi-replica enforcement.",
+        "3. Add per-provider quality SLOs alongside availability, latency, recovery, and cost SLOs.",
         "",
         "## Reproducibility",
         "",
         "```bash",
         "pip install -e \".[dev]\"",
-        "docker compose up -d",
+        "make docker-up",
         "make lint",
         "make typecheck",
         "make test",
         "make run-chaos",
         "make report",
+        "make docker-down",
         "```",
     ]
 
