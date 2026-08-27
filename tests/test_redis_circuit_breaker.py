@@ -8,6 +8,7 @@ import uuid
 from typing import Any
 
 import pytest
+from redis.exceptions import RedisError
 
 from reliability_lab.circuit_breaker import CircuitState
 
@@ -22,7 +23,7 @@ def _redis_available() -> bool:
         client.ping()
         client.close()
         return True
-    except Exception:
+    except RedisError:
         return False
 
 
