@@ -4,6 +4,9 @@ import json
 import random
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+from typing import Any
+
+import redis as redis_lib
 
 from reliability_lab.cache import ResponseCache, SharedRedisCache
 from reliability_lab.circuit_breaker import CircuitBreaker
@@ -59,14 +62,62 @@ def build_gateway(
                 config.cache.ttl_seconds,
                 config.cache.similarity_threshold,
             )
-            cache = redis_cache if redis_cache.ping() else ResponseCache(
-                config.cache.ttl_seconds,
-                config.cache.similarity_threshold,
+            cache = (
+                redis_cache
+                if redis_cache.ping()
+                else ResponseCache(
+                    config.cache.ttl_seconds,
+                    config.cache.similarity_threshold,
+                )
             )
         else:
             cache = ResponseCache(config.cache.ttl_seconds, config.cache.similarity_threshold)
 
     return ReliabilityGateway(providers, breakers, cache)
+
+
+def collect_redis_evidence(
+    redis_url: str,
+    ttl_seconds: int,
+    similarity_threshold: float,
+) -> dict[str, object]:
+    """Capture reproducible proof that Redis cache state is shared across instances."""
+    prefix = "rl:cache:evidence:"
+    writer = SharedRedisCache(redis_url, ttl_seconds, similarity_threshold, prefix=prefix)
+    reader = SharedRedisCache(redis_url, ttl_seconds, similarity_threshold, prefix=prefix)
+    try:
+        if not writer.ping():
+            return {
+                "available": False,
+                "shared_response": None,
+                "score": 0.0,
+                "keys": [],
+                "ttls_seconds": {},
+            }
+
+        writer.flush()
+        query = "Day 25 Redis shared cache evidence"
+        response = "shared cache evidence response"
+        writer.set(query, response, {"purpose": "grading_evidence"})
+        shared_response, score = reader.get(query)
+
+        client: Any = redis_lib.Redis.from_url(redis_url, decode_responses=True)
+        try:
+            keys = sorted(str(key) for key in client.scan_iter(f"{prefix}*"))
+            ttls = {key: int(client.ttl(key)) for key in keys}
+        finally:
+            client.close()
+
+        return {
+            "available": True,
+            "shared_response": shared_response,
+            "score": score,
+            "keys": keys,
+            "ttls_seconds": ttls,
+        }
+    finally:
+        reader.close()
+        writer.close()
 
 
 def calculate_recovery_time_ms(gateway: ReliabilityGateway) -> float | None:
@@ -88,7 +139,9 @@ def calculate_recovery_time_ms(gateway: ReliabilityGateway) -> float | None:
     return sum(recoveries_ms) / len(recoveries_ms)
 
 
-def _record_result(metrics: RunMetrics, route: str, cache_hit: bool, latency_ms: float, cost: float) -> None:
+def _record_result(
+    metrics: RunMetrics, route: str, cache_hit: bool, latency_ms: float, cost: float
+) -> None:
     metrics.total_requests += 1
     metrics.estimated_cost += cost
     if cache_hit:
@@ -175,14 +228,18 @@ def run_simulation(config: LabConfig, queries: list[str]) -> RunMetrics:
     if not config.scenarios:
         default_scenario = ScenarioConfig(name="default", description="baseline run")
         metrics = run_scenario(config, queries, default_scenario)
-        metrics.scenarios = {"default": "pass" if _scenario_passed(default_scenario, metrics) else "fail"}
+        metrics.scenarios = {
+            "default": "pass" if _scenario_passed(default_scenario, metrics) else "fail"
+        }
         return metrics
 
     combined = RunMetrics()
     recovery_samples: list[float] = []
     for scenario in config.scenarios:
         result = run_scenario(config, queries, scenario)
-        combined.scenarios[scenario.name] = "pass" if _scenario_passed(scenario, result) else "fail"
+        combined.scenarios[scenario.name] = (
+            "pass" if _scenario_passed(scenario, result) else "fail"
+        )
         combined.total_requests += result.total_requests
         combined.successful_requests += result.successful_requests
         combined.failed_requests += result.failed_requests
