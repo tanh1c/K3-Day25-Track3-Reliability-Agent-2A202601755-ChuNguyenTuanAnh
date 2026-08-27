@@ -64,6 +64,9 @@ def main() -> None:
     lines = [
         "# Day 25 Reliability Engineering Final Report",
         "",
+        "**Sinh viên:** Chu Nguyễn Tuấn Anh  ",
+        "**MSSV:** 2A202601755",
+        "",
         "## 1. Architecture summary",
         "",
         "The gateway uses cache-first routing, provider-specific circuit breakers, an ordered provider fallback chain, and a deterministic static fallback. Redis can replace in-memory cache for shared multi-instance state.",
@@ -144,6 +147,11 @@ def main() -> None:
     ]:
         lines.append(f"| {key} | {_fmt(metrics.get(key))} |")
 
+    lines += [
+        "",
+        "`recovery_time_ms` is expected to be close to 2000 ms because the circuit breaker deliberately stays OPEN for `reset_timeout_seconds = 2` before allowing a HALF_OPEN recovery probe. The observed value is slightly above 2 seconds because it also includes provider latency and normal scheduling/measurement overhead.",
+    ]
+
     with_cache = comparison.get("with_cache", {})
     without_cache = comparison.get("without_cache", {})
     with_cache_dict = with_cache if isinstance(with_cache, dict) else {}
@@ -160,6 +168,8 @@ def main() -> None:
         f"| latency_p95_ms | {_fmt(without_cache_dict.get('latency_p95_ms'))} | {_fmt(with_cache_dict.get('latency_p95_ms'))} | {_fmt(comparison.get('p95_delta_ms'))} ms |",
         f"| estimated_cost | {_fmt(without_cache_dict.get('estimated_cost'))} | {_fmt(with_cache_dict.get('estimated_cost'))} | {_fmt(comparison.get('cost_delta'))} |",
         f"| cache_hit_rate | 0 | {_fmt(with_cache_dict.get('cache_hit_rate'))} | semantic cache reuse |",
+        "",
+        "The starter metrics path records latency samples only when latency is greater than zero, so zero-latency cache hits are excluded from the percentile sample. Therefore P50 is not expected to improve reliably; the cache benefit is demonstrated more directly by `cache_hit_rate`, reduced `estimated_cost`, `estimated_cost_saved`, and preserved availability.",
         "",
         "## 6. Redis shared cache",
         "",
