@@ -1,6 +1,7 @@
 from __future__ import annotations
 
-from hypothesis import given, strategies as st
+from hypothesis import given
+from hypothesis import strategies as st
 
 from reliability_lab.circuit_breaker import CircuitBreaker, CircuitState
 
