@@ -1,12 +1,125 @@
-name: CI
-on: [push, pull_request]
+name: Reliability CI
+
+on:
+  push:
+    branches: [main, "feat/**"]
+  pull_request:
+
+permissions:
+  contents: read
+
+env:
+  REDIS_URL: redis://localhost:6379/0
+  PYTHONUNBUFFERED: "1"
+
 jobs:
-  test:
+  verify:
     runs-on: ubuntu-latest
+    timeout-minutes: 15
+    services:
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 10
+
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
         with:
           python-version: "3.11"
-      - run: pip install -e ".[dev]"
-      - run: make test
+          cache: pip
+
+      - name: Install package
+        run: pip install -e ".[dev]"
+
+      - name: Verify Redis
+        run: |
+          python - <<'PY'
+          import redis
+          client = redis.Redis.from_url("redis://localhost:6379/0")
+          assert client.ping()
+          client.close()
+          print("Redis integration service is healthy")
+          PY
+
+      - name: Lint
+        run: make lint
+
+      - name: Typecheck
+        run: make typecheck
+
+      - name: Test with Redis enabled
+        run: |
+          mkdir -p reports
+          set -o pipefail
+          pytest -q | tee reports/test-output.txt
+
+      - name: Generate chaos evidence
+        run: make run-chaos
+
+      - name: Generate final report
+        run: make report
+
+      - name: Validate grader artifacts
+        run: |
+          test -s reports/metrics.json
+          test -s reports/metrics.csv
+          test -s reports/cache_comparison.json
+          test -s reports/concurrent_metrics.json
+          test -s reports/final_report.md
+          python - <<'PY'
+          import json
+          from pathlib import Path
+
+          metrics = json.loads(Path("reports/metrics.json").read_text())
+          required = {
+              "availability",
+              "error_rate",
+              "latency_p50_ms",
+              "latency_p95_ms",
+              "latency_p99_ms",
+              "fallback_success_rate",
+              "cache_hit_rate",
+              "circuit_open_count",
+              "estimated_cost_saved",
+              "scenarios",
+          }
+          missing = required - metrics.keys()
+          assert not missing, f"missing metrics: {sorted(missing)}"
+          assert len(metrics["scenarios"]) >= 3
+
+          report = Path("reports/final_report.md").read_text()
+          for heading in [
+              "Architecture summary",
+              "Configuration",
+              "SLO definitions",
+              "Cache comparison",
+              "Redis shared cache",
+              "Chaos scenarios",
+              "Failure analysis",
+          ]:
+              assert heading in report, heading
+          print("grader artifacts validated")
+          PY
+
+      - name: Upload grading evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: reliability-lab-evidence
+          path: |
+            reports/test-output.txt
+            reports/metrics.json
+            reports/metrics.csv
+            reports/cache_comparison.json
+            reports/concurrent_metrics.json
+            reports/final_report.md
+          if-no-files-found: warn
