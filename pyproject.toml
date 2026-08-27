@@ -12,7 +12,14 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-dev = ["pytest>=8.2", "pytest-cov>=5.0", "ruff>=0.5", "mypy>=1.10"]
+dev = [
+  "pytest>=8.2",
+  "pytest-cov>=5.0",
+  "ruff>=0.5",
+  "mypy>=1.10",
+  "hypothesis>=6.112",
+  "types-PyYAML>=6.0.12",
+]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
@@ -22,6 +29,11 @@ markers = ["todo: tests that should pass after students implement TODOs"]
 [tool.ruff]
 line-length = 100
 src = ["src", "tests", "scripts"]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/test_cache.py" = ["RUF059"]
+"tests/test_redis_cache.py" = ["BLE001"]
+"tests/test_todo_requirements.py" = ["F401", "I001", "SIM115"]
 
 [tool.mypy]
 python_version = "3.10"

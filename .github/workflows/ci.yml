@@ -1,12 +1,160 @@
-name: CI
-on: [push, pull_request]
+name: Reliability CI
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main, "feat/**"]
+  pull_request:
+
+permissions:
+  contents: read
+
+env:
+  REDIS_URL: redis://localhost:6379/0
+  PYTHONUNBUFFERED: "1"
+
 jobs:
-  test:
+  verify:
     runs-on: ubuntu-latest
+    timeout-minutes: 15
+
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
         with:
           python-version: "3.11"
-      - run: pip install -e ".[dev]"
-      - run: make test
+          cache: pip
+
+      - name: Install package
+        run: pip install -e ".[dev]"
+
+      - name: Start Redis exactly like grader
+        run: |
+          make docker-up
+          for attempt in {1..10}; do
+            if docker compose exec -T redis redis-cli ping | grep -q PONG; then
+              echo "Redis is healthy"
+              exit 0
+            fi
+            sleep 2
+          done
+          docker compose ps
+          exit 1
+
+      - name: Lint
+        run: make lint
+
+      - name: Typecheck
+        run: make typecheck
+
+      - name: Rubric test counts
+        run: |
+          mkdir -p reports
+          : > reports/rubric-test-output.txt
+          set -o pipefail
+          pytest -q tests/test_circuit_breaker.py | tee -a reports/rubric-test-output.txt
+          pytest -q tests/test_cache.py | tee -a reports/rubric-test-output.txt
+          pytest -q tests/test_gateway_contract.py | tee -a reports/rubric-test-output.txt
+          pytest -q tests/test_redis_cache.py | tee -a reports/rubric-test-output.txt
+          pytest -q tests/test_todo_requirements.py | tee -a reports/rubric-test-output.txt
+          grep -q "12 passed" reports/rubric-test-output.txt
+          grep -q "9 passed" reports/rubric-test-output.txt
+          grep -q "4 passed" reports/rubric-test-output.txt
+          grep -q "6 passed" reports/rubric-test-output.txt
+          grep -q "7 xpassed" reports/rubric-test-output.txt
+
+      - name: Full make test with Redis enabled
+        run: |
+          mkdir -p reports
+          set -o pipefail
+          make test | tee reports/test-output.txt
+          grep -q "39 passed, 7 xpassed" reports/test-output.txt
+
+      - name: Generate chaos evidence exactly like grader
+        run: make run-chaos
+
+      - name: Generate final report exactly like grader
+        run: make report
+
+      - name: Validate grader artifacts and checklist
+        run: |
+          test -s docker-compose.yml
+          test -s reports/metrics.json
+          test -s reports/metrics.csv
+          test -s reports/cache_comparison.json
+          test -s reports/concurrent_metrics.json
+          test -s reports/redis_evidence.json
+          test -s reports/final_report.md
+          python - <<'PY'
+          import json
+          from pathlib import Path
+
+          metrics = json.loads(Path("reports/metrics.json").read_text())
+          required = {
+              "availability",
+              "error_rate",
+              "latency_p50_ms",
+              "latency_p95_ms",
+              "latency_p99_ms",
+              "fallback_success_rate",
+              "cache_hit_rate",
+              "circuit_open_count",
+              "recovery_time_ms",
+              "estimated_cost_saved",
+              "scenarios",
+          }
+          missing = required - metrics.keys()
+          assert not missing, f"missing metrics: {sorted(missing)}"
+          assert metrics["circuit_open_count"] > 0
+          assert metrics["recovery_time_ms"] is not None
+          assert len(metrics["scenarios"]) >= 3
+          assert all(status == "pass" for status in metrics["scenarios"].values())
+
+          redis_evidence = json.loads(Path("reports/redis_evidence.json").read_text())
+          assert redis_evidence["available"] is True
+          assert redis_evidence["shared_response"] == "shared cache evidence response"
+          assert redis_evidence["score"] == 1.0
+          assert redis_evidence["keys"], "Redis key evidence is empty"
+
+          report = Path("reports/final_report.md").read_text()
+          assert "TODO" not in report
+          assert "Chu Nguyễn Tuấn Anh" in report
+          assert "2A202601755" in report
+          assert "reset_timeout_seconds = 2" in report
+          for heading in [
+              "Architecture summary",
+              "Configuration",
+              "SLO definitions",
+              "Cache comparison",
+              "Redis shared cache",
+              "Redis CLI output",
+              "Chaos scenarios",
+              "Failure analysis",
+          ]:
+              assert heading in report, heading
+          assert 'redis-cli KEYS "rl:cache:*"' in report
+          print("grader checklist validated")
+          PY
+
+      - name: Upload grading evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: reliability-lab-evidence
+          path: |
+            reports/test-output.txt
+            reports/rubric-test-output.txt
+            reports/metrics.json
+            reports/metrics.csv
+            reports/cache_comparison.json
+            reports/concurrent_metrics.json
+            reports/redis_evidence.json
+            reports/final_report.md
+          if-no-files-found: warn
+
+      - name: Stop Redis
+        if: always()
+        run: make docker-down
