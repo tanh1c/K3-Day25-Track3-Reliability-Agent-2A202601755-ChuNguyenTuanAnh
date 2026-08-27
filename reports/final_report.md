@@ -1,5 +1,8 @@
 # Day 25 Reliability Engineering Final Report
 
+**Sinh viên:** Chu Nguyễn Tuấn Anh  
+**MSSV:** 2A202601755
+
 ## 1. Architecture summary
 
 The gateway uses cache-first routing, provider-specific circuit breakers, an ordered provider fallback chain, and a deterministic static fallback. Redis can replace in-memory cache for shared multi-instance state.
@@ -66,6 +69,8 @@ User Request
 | circuit_open_count | 7 |
 | recovery_time_ms | 2372.4920749664307 |
 
+`recovery_time_ms` is expected to be close to 2000 ms because the circuit breaker deliberately stays OPEN for `reset_timeout_seconds = 2` before allowing a HALF_OPEN recovery probe. The observed value is slightly above 2 seconds because it also includes provider latency and normal scheduling/measurement overhead.
+
 ## 5. Cache comparison
 
 The comparison uses the same healthy-provider scenario and random seed with cache enabled and disabled.
@@ -76,6 +81,8 @@ The comparison uses the same healthy-provider scenario and random seed with cach
 | latency_p95_ms | 239.14 | 234.4 | 4.74 ms |
 | estimated_cost | 0.06096 | 0.02181 | 0.03915 |
 | cache_hit_rate | 0 | 0.64 | semantic cache reuse |
+
+The starter metrics path records latency samples only when latency is greater than zero, so zero-latency cache hits are excluded from the percentile sample. Therefore P50 is not expected to improve reliably; the cache benefit is demonstrated more directly by `cache_hit_rate`, reduced `estimated_cost`, `estimated_cost_saved`, and preserved availability.
 
 ## 6. Redis shared cache
 
