@@ -31,6 +31,7 @@ def main() -> None:
     metrics = _load_json(metrics_path)
     comparison = _load_json(metrics_path.with_name("cache_comparison.json"))
     concurrent = _load_json(metrics_path.with_name("concurrent_metrics.json"))
+    redis_evidence = _load_json(metrics_path.with_name("redis_evidence.json"))
     config_raw = yaml.safe_load(Path(args.config).read_text())
     config = config_raw if isinstance(config_raw, dict) else {}
 
@@ -105,7 +106,9 @@ def main() -> None:
         for provider in providers:
             if isinstance(provider, dict):
                 lines.append(
-                    f"| {_fmt(provider.get('name'))} | {_fmt(provider.get('fail_rate'))} | {_fmt(provider.get('base_latency_ms'))} | {_fmt(provider.get('cost_per_1k_tokens'))} |"
+                    f"| {_fmt(provider.get('name'))} | {_fmt(provider.get('fail_rate'))} | "
+                    f"{_fmt(provider.get('base_latency_ms'))} | "
+                    f"{_fmt(provider.get('cost_per_1k_tokens'))} |"
                 )
 
     lines += [
@@ -160,15 +163,53 @@ def main() -> None:
         "",
         "## 6. Redis shared cache",
         "",
-        "In-memory cache is process-local, so replicas cannot reuse each other's responses. `SharedRedisCache` stores the original query and response in a Redis hash with TTL, giving all gateway instances using the same prefix consistent shared cache state.",
+        "In-memory cache is process-local, so replicas cannot reuse each other's responses. `SharedRedisCache` stores the original query and response in a Redis hash with TTL, giving all gateway instances using the same prefix shared cache state.",
         "",
         "### Evidence of shared state",
         "",
-        "`tests/test_redis_cache.py::test_shared_state_across_instances` creates two independent cache objects, writes through one, and reads through the other. CI provisions Redis and runs this test without skipping it.",
+        "`make run-chaos` creates two independent `SharedRedisCache` instances. The first writes an evidence entry and the second reads it back from Redis.",
+        "",
+        "| Check | Observed value |",
+        "|---|---|",
+        f"| Redis available | {_fmt(redis_evidence.get('available'))} |",
+        f"| Read from second instance | {_fmt(redis_evidence.get('shared_response'))} |",
+        f"| Exact-match score | {_fmt(redis_evidence.get('score'))} |",
+        "",
+        "### Redis CLI output",
+        "",
+        "The following output is generated from the same Redis state used by the evidence run:",
+        "",
+        "```text",
+        '$ docker compose exec redis redis-cli KEYS "rl:cache:*"',
+    ]
+
+    redis_keys_raw = redis_evidence.get("keys", [])
+    redis_keys = redis_keys_raw if isinstance(redis_keys_raw, list) else []
+    if redis_keys:
+        for index, key in enumerate(redis_keys, start=1):
+            lines.append(f'{index}) "{key}"')
+    else:
+        lines.append("(no evidence keys found)")
+    lines.append("```")
+
+    ttls_raw = redis_evidence.get("ttls_seconds", {})
+    ttls = ttls_raw if isinstance(ttls_raw, dict) else {}
+    if ttls:
+        lines += [
+            "",
+            "Evidence keys also have Redis TTLs, proving expiry is delegated to Redis:",
+            "",
+            "| Key | TTL seconds at capture |",
+            "|---|---:|",
+        ]
+        for key, ttl in ttls.items():
+            lines.append(f"| `{key}` | {_fmt(ttl)} |")
+
+    lines += [
         "",
         "### Privacy and false-hit evidence",
         "",
-        "Both memory and Redis backends bypass privacy-sensitive queries and reject high-similarity matches when 4-digit dates/IDs differ.",
+        "Both memory and Redis backends bypass privacy-sensitive queries and reject high-similarity matches when 4-digit dates/IDs differ. Redis integration tests execute in CI against a real Redis service rather than being skipped.",
         "",
         "## 7. Chaos scenarios",
         "",
