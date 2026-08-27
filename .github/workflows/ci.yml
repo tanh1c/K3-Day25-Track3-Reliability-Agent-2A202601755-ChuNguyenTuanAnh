@@ -1,6 +1,7 @@
 name: Reliability CI
 
 on:
+  workflow_dispatch:
   push:
     branches: [main, "feat/**"]
   pull_request:
