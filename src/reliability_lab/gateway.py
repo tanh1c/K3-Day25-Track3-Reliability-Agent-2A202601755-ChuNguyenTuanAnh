@@ -4,7 +4,7 @@ from dataclasses import dataclass
 
 from reliability_lab.budget import CostBudget
 from reliability_lab.cache import ResponseCache, SharedRedisCache
-from reliability_lab.circuit_breaker import CircuitBreaker, CircuitOpenError
+from reliability_lab.circuit_breaker import CircuitBreakerLike, CircuitOpenError
 from reliability_lab.providers import FakeLLMProvider, ProviderError
 
 
@@ -25,7 +25,7 @@ class ReliabilityGateway:
     def __init__(
         self,
         providers: list[FakeLLMProvider],
-        breakers: dict[str, CircuitBreaker],
+        breakers: dict[str, CircuitBreakerLike],
         cache: ResponseCache | SharedRedisCache | None = None,
         budget: CostBudget | None = None,
     ):
