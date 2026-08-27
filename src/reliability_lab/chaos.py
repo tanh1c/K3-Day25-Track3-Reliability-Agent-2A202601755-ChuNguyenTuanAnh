@@ -7,13 +7,16 @@ from pathlib import Path
 from typing import Any
 
 import redis as redis_lib
+from redis.exceptions import RedisError
 
+from reliability_lab.budget import CostBudget
 from reliability_lab.cache import ResponseCache, SharedRedisCache
-from reliability_lab.circuit_breaker import CircuitBreaker
+from reliability_lab.circuit_breaker import CircuitBreaker, CircuitBreakerLike
 from reliability_lab.config import LabConfig, ScenarioConfig
 from reliability_lab.gateway import ReliabilityGateway
 from reliability_lab.metrics import RunMetrics
 from reliability_lab.providers import FakeLLMProvider
+from reliability_lab.redis_circuit_breaker import SharedRedisCircuitBreaker
 
 
 def load_queries(path: str | Path = "data/sample_queries.jsonl") -> list[str]:
@@ -23,6 +26,45 @@ def load_queries(path: str | Path = "data/sample_queries.jsonl") -> list[str]:
             continue
         queries.append(json.loads(line)["query"])
     return queries
+
+
+def _local_breakers(config: LabConfig) -> dict[str, CircuitBreakerLike]:
+    return {
+        provider_config.name: CircuitBreaker(
+            name=provider_config.name,
+            failure_threshold=config.circuit_breaker.failure_threshold,
+            reset_timeout_seconds=config.circuit_breaker.reset_timeout_seconds,
+            success_threshold=config.circuit_breaker.success_threshold,
+        )
+        for provider_config in config.providers
+    }
+
+
+def _build_breakers(config: LabConfig) -> dict[str, CircuitBreakerLike]:
+    if config.circuit_breaker.backend != "redis":
+        return _local_breakers(config)
+
+    distributed: dict[str, CircuitBreakerLike] = {}
+    opened_clients: list[SharedRedisCircuitBreaker] = []
+    try:
+        for provider_config in config.providers:
+            breaker = SharedRedisCircuitBreaker(
+                name=provider_config.name,
+                failure_threshold=config.circuit_breaker.failure_threshold,
+                reset_timeout_seconds=config.circuit_breaker.reset_timeout_seconds,
+                success_threshold=config.circuit_breaker.success_threshold,
+                redis_url=config.circuit_breaker.redis_url,
+            )
+            if not breaker.ping():
+                breaker.close()
+                raise RedisError("Redis circuit-breaker backend is unavailable")
+            distributed[provider_config.name] = breaker
+            opened_clients.append(breaker)
+    except RedisError:
+        for breaker in opened_clients:
+            breaker.close()
+        return _local_breakers(config)
+    return distributed
 
 
 def build_gateway(
@@ -44,15 +86,7 @@ def build_gateway(
             )
         )
 
-    breakers = {
-        provider_config.name: CircuitBreaker(
-            name=provider_config.name,
-            failure_threshold=config.circuit_breaker.failure_threshold,
-            reset_timeout_seconds=config.circuit_breaker.reset_timeout_seconds,
-            success_threshold=config.circuit_breaker.success_threshold,
-        )
-        for provider_config in config.providers
-    }
+    breakers = _build_breakers(config)
 
     cache: ResponseCache | SharedRedisCache | None = None
     if config.cache.enabled:
@@ -73,7 +107,12 @@ def build_gateway(
         else:
             cache = ResponseCache(config.cache.ttl_seconds, config.cache.similarity_threshold)
 
-    return ReliabilityGateway(providers, breakers, cache)
+    budget = (
+        CostBudget(config.budget.limit, config.budget.switch_ratio)
+        if config.budget.enabled
+        else None
+    )
+    return ReliabilityGateway(providers, breakers, cache=cache, budget=budget)
 
 
 def collect_redis_evidence(
