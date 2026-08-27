@@ -5,7 +5,12 @@ import json
 import random
 from pathlib import Path
 
-from reliability_lab.chaos import load_queries, run_scenario, run_scenario_concurrent, run_simulation
+from reliability_lab.chaos import (
+    load_queries,
+    run_scenario,
+    run_scenario_concurrent,
+    run_simulation,
+)
 from reliability_lab.config import ScenarioConfig, load_config
 
 
