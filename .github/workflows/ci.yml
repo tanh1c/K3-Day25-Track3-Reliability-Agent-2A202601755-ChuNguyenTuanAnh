@@ -75,6 +75,7 @@ jobs:
           test -s reports/metrics.csv
           test -s reports/cache_comparison.json
           test -s reports/concurrent_metrics.json
+          test -s reports/redis_evidence.json
           test -s reports/final_report.md
           python - <<'PY'
           import json
@@ -96,6 +97,13 @@ jobs:
           missing = required - metrics.keys()
           assert not missing, f"missing metrics: {sorted(missing)}"
           assert len(metrics["scenarios"]) >= 3
+          assert all(status == "pass" for status in metrics["scenarios"].values())
+
+          redis_evidence = json.loads(Path("reports/redis_evidence.json").read_text())
+          assert redis_evidence["available"] is True
+          assert redis_evidence["shared_response"] == "shared cache evidence response"
+          assert redis_evidence["score"] == 1.0
+          assert redis_evidence["keys"], "Redis key evidence is empty"
 
           report = Path("reports/final_report.md").read_text()
           for heading in [
@@ -104,10 +112,12 @@ jobs:
               "SLO definitions",
               "Cache comparison",
               "Redis shared cache",
+              "Redis CLI output",
               "Chaos scenarios",
               "Failure analysis",
           ]:
               assert heading in report, heading
+          assert 'redis-cli KEYS "rl:cache:*"' in report
           print("grader artifacts validated")
           PY
 
@@ -122,5 +132,6 @@ jobs:
             reports/metrics.csv
             reports/cache_comparison.json
             reports/concurrent_metrics.json
+            reports/redis_evidence.json
             reports/final_report.md
           if-no-files-found: warn
