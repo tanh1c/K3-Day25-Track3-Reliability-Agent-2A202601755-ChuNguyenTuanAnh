@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import csv
 import json
 from pathlib import Path
 from statistics import median
@@ -60,19 +61,23 @@ class RunMetrics(BaseModel):
         }
 
     def write_json(self, path: str | Path) -> None:
-        Path(path).parent.mkdir(parents=True, exist_ok=True)
-        Path(path).write_text(json.dumps(self.to_report_dict(), indent=2, ensure_ascii=False))
+        output = Path(path)
+        output.parent.mkdir(parents=True, exist_ok=True)
+        output.write_text(json.dumps(self.to_report_dict(), indent=2, ensure_ascii=False))
 
     def write_csv(self, path: str | Path) -> None:
-        """Export metrics to CSV format.
-
-        TODO(student): Implement CSV export:
-        1. Get report dict via self.to_report_dict()
-        2. Flatten the "scenarios" dict: each scenario becomes "scenario_{name}" column
-        3. Write a single-row CSV with csv.DictWriter (import csv at top of file)
-        4. Create parent directories if needed
-        """
-        raise NotImplementedError("TODO: implement write_csv()")
+        output = Path(path)
+        output.parent.mkdir(parents=True, exist_ok=True)
+        report = self.to_report_dict()
+        raw_scenarios = report.pop("scenarios", {})
+        scenarios = raw_scenarios if isinstance(raw_scenarios, dict) else {}
+        row = dict(report)
+        for name, status in scenarios.items():
+            row[f"scenario_{name}"] = status
+        with output.open("w", newline="", encoding="utf-8") as handle:
+            writer = csv.DictWriter(handle, fieldnames=list(row.keys()))
+            writer.writeheader()
+            writer.writerow(row)
 
 
 def percentile(values: Iterable[float], q: float) -> float:
